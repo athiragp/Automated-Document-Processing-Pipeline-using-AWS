@@ -1,0 +1,203 @@
+import json
+import boto3
+import os
+import time
+import uuid
+from decimal import Decimal
+
+s3 = boto3.client('s3')
+textract = boto3.client('textract')
+bedrock = boto3.client('bedrock-runtime')
+dynamodb = boto3.resource('dynamodb')
+
+INPUT_BUCKET = os.environ["INPUT_BUCKET"]
+PROCESSED_BUCKET = os.environ["PROCESSED_BUCKET"]
+DDB_TABLE = os.environ["DDB_TABLE"]
+MODEL_ID = os.environ["MODEL_ID"]
+
+table = dynamodb.Table(DDB_TABLE)
+
+def lambda_handler(event, context):
+
+    record = event['Records'][0]
+    bucket = record['s3']['bucket']['name']
+    key = record['s3']['object']['key']
+
+    file_name = key.split("/")[-1]
+    document_id = str(uuid.uuid4())
+
+    local_path = f"/tmp/{file_name}"
+    s3.download_file(bucket, key, local_path)
+
+    # OCR
+    text, confidence = extract_text(local_path, key)
+
+    # Cleaning with Bedrock
+    clean_text = bedrock_clean_text(text)
+
+    # Extract EVERYTHING including doc_type via Bedrock
+    extracted_fields = extract_structured_fields(clean_text)
+
+    # Save to DynamoDB
+    table.put_item(
+        Item={
+            "doc_id": document_id,
+            "customer_name": extracted_fields.get("customer_name", "NA"),
+            "doc_type": extracted_fields.get("doc_type", "NA"),
+            "id_number": extracted_fields.get("id_number", "NA"),
+            "address": extracted_fields.get("address", "NA"),
+            "dob": extracted_fields.get("dob", "NA"),
+            "status": "PROCESSED",
+            "confidence": Decimal(str(confidence)),
+            "timestamp": int(time.time())
+        }
+    )
+
+    # Move original document to processed bucket
+    s3.copy_object(
+        Bucket=PROCESSED_BUCKET,
+        CopySource={'Bucket': bucket, 'Key': key},
+        Key=f"processed/{file_name}"
+    )
+
+    return {"message": "Processing complete"}
+
+
+def extract_text(local_path, s3_key):
+
+    ext = s3_key.lower().split(".")[-1]
+
+    # ---------- IMAGE (PNG / JPG / JPEG) ----------
+    if ext in ["jpg", "jpeg", "png"]:
+        with open(local_path, "rb") as doc:
+            response = textract.detect_document_text(
+                Document={'Bytes': doc.read()}
+            )
+
+        lines = []
+        conf = []
+
+        for block in response['Blocks']:
+            if block['BlockType'] == 'LINE':
+                lines.append(block['Text'])
+                conf.append(block.get('Confidence', 0))
+
+        avg_conf = sum(conf) / len(conf) if conf else 0
+        return "\n".join(lines), avg_conf
+
+    # ---------- PDF (ASYNC) ----------
+    elif ext == "pdf":
+
+        start = textract.start_document_text_detection(
+            DocumentLocation={
+                'S3Object': {
+                    'Bucket': INPUT_BUCKET,
+                    'Name': s3_key
+                }
+            }
+        )
+
+        job_id = start["JobId"]
+
+        while True:
+            job = textract.get_document_text_detection(JobId=job_id)
+
+            if job["JobStatus"] == "SUCCEEDED":
+                break
+            if job["JobStatus"] == "FAILED":
+                raise Exception("Textract job failed")
+
+            time.sleep(2)
+
+        lines = []
+        conf = []
+
+        for block in job["Blocks"]:
+            if block["BlockType"] == "LINE":
+                lines.append(block["Text"])
+                conf.append(block.get("Confidence", 0))
+
+        avg_conf = sum(conf) / len(conf) if conf else 0
+        return "\n".join(lines), avg_conf
+
+
+def bedrock_clean_text(text):
+
+    prompt = f"""
+    Clean the OCR text.
+    Remove noise and obvious OCR errors.
+    Preserve names, ID numbers, addresses, and dates.
+    Return only cleaned text.
+
+    OCR TEXT:
+    {text}
+    """
+
+    response = bedrock.invoke_model(
+        modelId=MODEL_ID,
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt}
+                    ]
+                }
+            ],
+            "max_tokens": 2000
+        })
+    )
+
+    body = json.loads(response["body"].read())
+    return body["content"][0]["text"]
+
+
+def extract_structured_fields(clean_text):
+
+    prompt = f"""
+    From the text extract the following:
+
+    - customer_name
+    - doc_type
+    - id_number
+    - address
+    - dob
+
+    If missing return NA.
+    Reply ONLY in JSON with these exact keys.
+
+    Text:
+    {clean_text}
+    """
+
+    response = bedrock.invoke_model(
+        modelId=MODEL_ID,
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": prompt}]
+                }
+            ],
+            "max_tokens": 2000
+        })
+    )
+
+    body = json.loads(response["body"].read())
+
+    try:
+        return json.loads(body["content"][0]["text"])
+    except Exception:
+        return {
+            "customer_name": "NA",
+            "doc_type": "NA",
+            "id_number": "NA",
+            "address": "NA",
+            "dob": "NA"
+        }
